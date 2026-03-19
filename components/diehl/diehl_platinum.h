@@ -98,6 +98,7 @@ enum DiehlOperatingState : uint8_t {
 enum class CommPhase : uint8_t {
   IDLE,
   QUERY_VALUES,
+  WAIT_ECHO,
   WAIT_RESPONSE,
 };
 
@@ -153,7 +154,6 @@ class DiehlPlatinumComponent : public PollingComponent, public uart::UARTDevice 
   // --- Protocol helpers ---
   static uint16_t calc_crc16(const uint8_t *data, size_t len);
   void send_value_request_(DiehlValueType value_type);
-  bool read_response_(uint8_t *buffer, size_t &length, uint32_t timeout_ms = 200);
   bool validate_checksum_(const uint8_t *buffer, size_t length);
   void clear_rx_buffer_();
 
@@ -163,9 +163,13 @@ class DiehlPlatinumComponent : public PollingComponent, public uart::UARTDevice 
 
   // --- Query state machine ---
   void query_next_value_();
-  void process_response_();
+  void handle_wait_echo_();
+  void handle_wait_response_();
   void process_received_data_();
   void update_connection_status_();
+
+  // --- Logging helper ---
+  void log_hex_(const char *prefix, const uint8_t *data, size_t len);
 
   // --- State string conversion ---
   static const char *operating_state_to_string(uint8_t state);
@@ -212,8 +216,19 @@ class DiehlPlatinumComponent : public PollingComponent, public uart::UARTDevice 
   CommPhase comm_phase_{CommPhase::IDLE};
   bool update_requested_{false};
   uint32_t last_send_time_{0};
+  uint32_t echo_done_time_{0};
+
+  /// Buffer holding the 6-byte TX frame we sent (to match the echo against).
+  uint8_t tx_frame_[6]{};
+
+  /// Echo receive buffer — we expect exactly 6 bytes echoed back.
+  uint8_t echo_buffer_[6]{};
+  size_t echo_len_{0};
+
+  /// Response receive buffer — the actual data response from the inverter.
   uint8_t rx_buffer_[64]{};
   size_t rx_len_{0};
+
   uint8_t query_index_{0};
   uint8_t consecutive_errors_{0};
   bool connected_{false};
