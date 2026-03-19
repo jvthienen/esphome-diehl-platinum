@@ -164,6 +164,8 @@ class DiehlPlatinumComponent : public PollingComponent, public uart::UARTDevice 
   // --- Query state machine ---
   void query_next_value_();
   void process_response_();
+  void process_received_data_();
+  void update_connection_status_();
 
   // --- State string conversion ---
   static const char *operating_state_to_string(uint8_t state);
