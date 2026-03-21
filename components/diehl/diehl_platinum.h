@@ -154,11 +154,10 @@ class DiehlPlatinumComponent : public PollingComponent, public uart::UARTDevice 
  protected:
   // --- Protocol helpers ---
   static uint16_t calc_crc16(const uint8_t *data, size_t len);
-  void send_raw_frame_(const uint8_t *data, size_t len);
-  void send_value_request_(DiehlValueType value_type);
   void send_init_handshake_();
+  void send_value_request_(DiehlValueType value_type);
   bool validate_checksum_(const uint8_t *buffer, size_t length);
-  void clear_rx_buffer_();
+  void drain_rx_noise_();
 
   // --- Value parsing ---
   float parse_value_response_(const uint8_t *buffer, size_t length, DiehlValueType type);
@@ -220,19 +219,17 @@ class DiehlPlatinumComponent : public PollingComponent, public uart::UARTDevice 
   CommPhase comm_phase_{CommPhase::IDLE};
   uint32_t last_send_time_{0};
 
-  /// The number of bytes we sent in the last TX frame (to skip our own TX loopback).
-  size_t tx_frame_len_{0};
-  /// Count of our own TX bytes read back so far (loopback skip counter).
-  size_t loopback_skipped_{0};
-
-  /// Response receive buffer — the actual data response from the inverter.
+  /// Response receive buffer.
   uint8_t rx_buffer_[64]{};
   size_t rx_len_{0};
+  /// Whether we have found the first valid (non-zero) byte in the current read.
+  bool rx_synced_{false};
+  /// Count of zero bytes discarded while waiting for sync.
+  uint32_t noise_zeros_discarded_{0};
 
   uint8_t query_index_{0};
   uint8_t consecutive_errors_{0};
   bool connected_{false};
-  bool inverter_initialized_{false};
   uint8_t init_retry_count_{0};
 
   /// List of value types to query, built dynamically based on configured sensors.
