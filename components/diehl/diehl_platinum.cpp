@@ -14,12 +14,20 @@ static const uint8_t CMD_GET_VALUE_HEADER = 0x35;  // 53 decimal
 static const uint8_t CMD_ADDR = 0x13;              // 19 decimal — inverter address
 static const uint8_t RESPONSE_END_OF_LIST = 0x84;  // 132 decimal
 
+// Valid response header bytes the inverter can send as byte 0.
+// getValue echo/response starts with 0x35; error/end with 0x84;
+// init response may start with 0xC5 or other.
+// Crucially, 0x00 is NEVER a valid start byte.
+static inline bool is_valid_header_byte(uint8_t b) {
+  return b != 0x00;
+}
+
 // Minimum valid data response: header(3) + at least 1 payload + CRC(2) = 6
 static const size_t MIN_RESPONSE_LEN = 6;
 
 // Timeouts (ms)
 static const uint32_t RESPONSE_TIMEOUT_MS = 800;
-static const uint32_t INIT_TIMEOUT_MS = 1500;
+static const uint32_t INIT_TIMEOUT_MS = 2000;
 // Max consecutive errors before declaring disconnected
 static const uint8_t MAX_CONSECUTIVE_ERRORS = 5;
 // Max init retries before giving up for this update cycle
@@ -54,15 +62,19 @@ void DiehlPlatinumComponent::log_hex_(const char *prefix, const uint8_t *data, s
 }
 
 // ============================================================================
-// Send raw frame (with loopback tracking)
+// Drain noise / zero bytes from RX
 // ============================================================================
 
-void DiehlPlatinumComponent::send_raw_frame_(const uint8_t *data, size_t len) {
-  this->log_hex_("TX", data, len);
-  this->write_array(data, len);
-  this->flush();
-  this->tx_frame_len_ = len;
-  this->loopback_skipped_ = 0;
+void DiehlPlatinumComponent::drain_rx_noise_() {
+  uint8_t tmp;
+  uint32_t drained = 0;
+  while (this->available()) {
+    this->read_byte(&tmp);
+    drained++;
+  }
+  if (drained > 0) {
+    ESP_LOGD(TAG, "Drained %u bytes of RX noise before transmit", (unsigned) drained);
+  }
 }
 
 // ============================================================================
@@ -143,7 +155,7 @@ void DiehlPlatinumComponent::setup() {
     this->connection_status_binary_sensor_->publish_state(false);
   }
 
-  this->clear_rx_buffer_();
+  this->drain_rx_noise_();
 }
 
 // ============================================================================
@@ -196,7 +208,7 @@ void DiehlPlatinumComponent::dump_config() {
 }
 
 // ============================================================================
-// Update (called by PollingComponent on the configured interval)
+// Update
 // ============================================================================
 
 void DiehlPlatinumComponent::update() {
@@ -205,7 +217,6 @@ void DiehlPlatinumComponent::update() {
     return;
   }
 
-  // Don't start a new cycle if one is still running
   if (this->comm_phase_ != CommPhase::IDLE) {
     ESP_LOGD(TAG, "Previous update cycle still running, skipping");
     return;
@@ -214,14 +225,11 @@ void DiehlPlatinumComponent::update() {
   ESP_LOGD(TAG, "Starting update cycle, querying %zu values", this->query_list_.size());
 
   this->query_index_ = 0;
-
-  // Always send init handshake at the start of each update cycle.
-  // The inverter requires this to "wake up" / establish the session.
   this->comm_phase_ = CommPhase::INIT_SEND;
 }
 
 // ============================================================================
-// Loop (non-blocking state machine for UART communication)
+// Loop
 // ============================================================================
 
 void DiehlPlatinumComponent::loop() {
@@ -254,20 +262,19 @@ void DiehlPlatinumComponent::loop() {
 }
 
 // ============================================================================
-// Init handshake — required before the inverter responds to getValue queries
+// Init handshake
 // ============================================================================
 
 void DiehlPlatinumComponent::send_init_handshake_() {
   ESP_LOGD(TAG, "Sending init handshake to inverter...");
 
-  this->clear_rx_buffer_();
+  this->drain_rx_noise_();
 
-  // Init frame from the reference implementation:
-  //   0xC5 (197), 0x13 (19), 0x03 (len=3), 0x00, 0x00, 0xC3 (195), CRC_H, CRC_L
+  // Init frame: 0xC5, 0x13, 0x03, 0x00, 0x00, 0xC3, CRC_H, CRC_L
   uint8_t init_frame[8];
   init_frame[0] = 0xC5;
-  init_frame[1] = CMD_ADDR;    // 0x13
-  init_frame[2] = 0x03;        // payload length = 3
+  init_frame[1] = CMD_ADDR;
+  init_frame[2] = 0x03;
   init_frame[3] = 0x00;
   init_frame[4] = 0x00;
   init_frame[5] = 0xC3;
@@ -276,44 +283,73 @@ void DiehlPlatinumComponent::send_init_handshake_() {
   init_frame[6] = (crc >> 8) & 0xFF;
   init_frame[7] = crc & 0xFF;
 
+  this->log_hex_("TX INIT", init_frame, 8);
+  this->write_array(init_frame, 8);
+  this->flush();
+
   this->rx_len_ = 0;
-  this->send_raw_frame_(init_frame, 8);
+  this->rx_synced_ = false;
+  this->noise_zeros_discarded_ = 0;
   this->last_send_time_ = millis();
 }
 
 // ============================================================================
-// Wait for init handshake response
+// Wait for init response
 // ============================================================================
 
 void DiehlPlatinumComponent::handle_init_wait_() {
   uint32_t elapsed = millis() - this->last_send_time_;
 
-  // Read bytes, skipping our own TX loopback first
   while (this->available()) {
     uint8_t byte;
     if (!this->read_byte(&byte)) break;
 
-    if (this->loopback_skipped_ < this->tx_frame_len_) {
-      // This byte is our own TX echoed back — discard it
-      this->loopback_skipped_++;
-      continue;
+    // Discard 0x00 noise bytes until we see a valid header
+    if (!this->rx_synced_) {
+      if (!is_valid_header_byte(byte)) {
+        this->noise_zeros_discarded_++;
+        continue;
+      }
+      // Found first valid byte — we are synced
+      this->rx_synced_ = true;
+      if (this->noise_zeros_discarded_ > 0) {
+        ESP_LOGD(TAG, "Init: discarded %u noise zero-bytes before sync",
+                 (unsigned) this->noise_zeros_discarded_);
+      }
     }
 
-    // This byte is from the inverter
     if (this->rx_len_ < sizeof(this->rx_buffer_)) {
       this->rx_buffer_[this->rx_len_++] = byte;
     }
   }
 
-  // Check if we got a response
-  if (this->rx_len_ > 0) {
-    this->log_hex_("INIT RX", this->rx_buffer_, this->rx_len_);
+  // If we have synced data, check if response is complete
+  if (this->rx_synced_ && this->rx_len_ >= 3) {
+    size_t expected_len = 3 + this->rx_buffer_[2] + 2;
 
-    // Any response from the inverter (even an error 0x84) means it's alive.
-    // The init response structure may vary, but receiving anything beyond
-    // our own loopback proves the inverter is communicating.
-    ESP_LOGD(TAG, "Init handshake got response (%zu bytes), inverter is communicating", this->rx_len_);
-    this->inverter_initialized_ = true;
+    if (this->rx_len_ >= expected_len) {
+      this->log_hex_("INIT RX", this->rx_buffer_, this->rx_len_);
+
+      // Validate CRC on init response
+      if (this->validate_checksum_(this->rx_buffer_, this->rx_len_)) {
+        ESP_LOGD(TAG, "Init handshake successful, inverter responded with valid frame");
+        this->init_retry_count_ = 0;
+        this->consecutive_errors_ = 0;
+        this->update_connection_status_();
+        this->comm_phase_ = CommPhase::QUERY_VALUES;
+        return;
+      } else {
+        ESP_LOGD(TAG, "Init response CRC invalid, but inverter is responding — proceeding");
+        this->init_retry_count_ = 0;
+        this->comm_phase_ = CommPhase::QUERY_VALUES;
+        return;
+      }
+    }
+  }
+
+  // Also accept 0x84 error response (1 byte, means inverter is alive but busy)
+  if (this->rx_synced_ && this->rx_len_ >= 1 && this->rx_buffer_[0] == RESPONSE_END_OF_LIST) {
+    ESP_LOGD(TAG, "Init: inverter responded with 0x84 (busy/error), but it's alive — proceeding");
     this->init_retry_count_ = 0;
     this->comm_phase_ = CommPhase::QUERY_VALUES;
     return;
@@ -322,18 +358,25 @@ void DiehlPlatinumComponent::handle_init_wait_() {
   // Timeout
   if (elapsed > INIT_TIMEOUT_MS) {
     this->init_retry_count_++;
-    ESP_LOGD(TAG, "Init handshake timeout (attempt %" PRIu8 "/%" PRIu8 ")",
-             this->init_retry_count_, MAX_INIT_RETRIES);
+
+    if (this->noise_zeros_discarded_ > 0 && !this->rx_synced_) {
+      ESP_LOGD(TAG, "Init timeout: received only %u zero-bytes (line noise), no valid data (attempt %" PRIu8 "/%" PRIu8 ")",
+               (unsigned) this->noise_zeros_discarded_, this->init_retry_count_, MAX_INIT_RETRIES);
+    } else if (this->rx_len_ > 0) {
+      this->log_hex_("INIT RX (incomplete)", this->rx_buffer_, this->rx_len_);
+      ESP_LOGD(TAG, "Init timeout with partial data (attempt %" PRIu8 "/%" PRIu8 ")",
+               this->init_retry_count_, MAX_INIT_RETRIES);
+    } else {
+      ESP_LOGD(TAG, "Init timeout, no response at all (attempt %" PRIu8 "/%" PRIu8 ")",
+               this->init_retry_count_, MAX_INIT_RETRIES);
+    }
 
     if (this->init_retry_count_ < MAX_INIT_RETRIES) {
-      // Retry
       this->comm_phase_ = CommPhase::INIT_SEND;
     } else {
-      // Give up for this cycle
-      ESP_LOGD(TAG, "Init handshake failed after %" PRIu8 " retries, inverter not responding", MAX_INIT_RETRIES);
-      this->inverter_initialized_ = false;
+      ESP_LOGD(TAG, "Init handshake failed after %" PRIu8 " attempts — inverter not responding", MAX_INIT_RETRIES);
       this->init_retry_count_ = 0;
-      this->consecutive_errors_ = MAX_CONSECUTIVE_ERRORS;  // Force disconnected
+      this->consecutive_errors_ = MAX_CONSECUTIVE_ERRORS;
       this->update_connection_status_();
       this->comm_phase_ = CommPhase::IDLE;
     }
@@ -341,7 +384,7 @@ void DiehlPlatinumComponent::handle_init_wait_() {
 }
 
 // ============================================================================
-// Send a value request and transition to WAIT_RESPONSE
+// Send value request
 // ============================================================================
 
 void DiehlPlatinumComponent::query_next_value_() {
@@ -349,64 +392,82 @@ void DiehlPlatinumComponent::query_next_value_() {
   ESP_LOGD(TAG, "Querying value type 0x%02X (index %u/%zu)",
            static_cast<uint8_t>(vtype), this->query_index_ + 1, this->query_list_.size());
 
-  this->clear_rx_buffer_();
+  this->drain_rx_noise_();
 
-  // Build TX frame: [0x35, 0x13, 0x01, valueType, CRC_H, CRC_L]
   uint8_t msg[6];
   msg[0] = CMD_GET_VALUE_HEADER;  // 0x35
   msg[1] = CMD_ADDR;              // 0x13
-  msg[2] = 0x01;                  // payload length = 1
+  msg[2] = 0x01;                  // payload len = 1
   msg[3] = static_cast<uint8_t>(vtype);
   uint16_t crc = calc_crc16(msg, 4);
   msg[4] = (crc >> 8) & 0xFF;
   msg[5] = crc & 0xFF;
 
+  this->log_hex_("TX", msg, 6);
+  this->write_array(msg, 6);
+  this->flush();
+
   this->rx_len_ = 0;
-  this->send_raw_frame_(msg, 6);
+  this->rx_synced_ = false;
+  this->noise_zeros_discarded_ = 0;
   this->last_send_time_ = millis();
   this->comm_phase_ = CommPhase::WAIT_RESPONSE;
 }
 
 // ============================================================================
-// WAIT_RESPONSE: Skip TX loopback, then read the actual inverter response
+// Wait for value response
 // ============================================================================
 
 void DiehlPlatinumComponent::handle_wait_response_() {
   uint32_t elapsed = millis() - this->last_send_time_;
 
-  // Read bytes, skipping our own TX loopback first
   while (this->available()) {
     uint8_t byte;
     if (!this->read_byte(&byte)) break;
 
-    if (this->loopback_skipped_ < this->tx_frame_len_) {
-      // This byte is our own TX echoed back — discard it
-      this->loopback_skipped_++;
-      continue;
+    // Discard 0x00 noise bytes until we see a valid protocol header
+    if (!this->rx_synced_) {
+      if (!is_valid_header_byte(byte)) {
+        this->noise_zeros_discarded_++;
+        continue;
+      }
+      this->rx_synced_ = true;
+      if (this->noise_zeros_discarded_ > 0) {
+        ESP_LOGD(TAG, "Discarded %u noise zero-bytes before response",
+                 (unsigned) this->noise_zeros_discarded_);
+      }
     }
 
-    // This byte is from the inverter
     if (this->rx_len_ < sizeof(this->rx_buffer_)) {
       this->rx_buffer_[this->rx_len_++] = byte;
     }
   }
 
-  // Check for error/end-of-list as first byte
-  if (this->rx_len_ >= 1 && this->rx_buffer_[0] == RESPONSE_END_OF_LIST) {
-    ESP_LOGD(TAG, "Received error/end-of-list (0x84) for value type 0x%02X",
+  // Check for 0x84 error/end-of-list (single byte)
+  if (this->rx_synced_ && this->rx_len_ >= 1 && this->rx_buffer_[0] == RESPONSE_END_OF_LIST) {
+    ESP_LOGD(TAG, "Received 0x84 (error/unsupported) for value type 0x%02X",
              static_cast<uint8_t>(this->query_list_[this->query_index_]));
-    this->consecutive_errors_++;
-    this->update_connection_status_();
+    // 0x84 means the inverter IS responding, just doesn't support this value
+    // Don't count this as a connection error
     this->advance_to_next_query_();
     return;
   }
 
-  // Once we have the header (3 bytes), we know expected total length
-  if (this->rx_len_ >= 3) {
-    size_t expected_len = 3 + this->rx_buffer_[2] + 2;  // header + payload + CRC
+  // Once we have the header, check for complete frame
+  if (this->rx_synced_ && this->rx_len_ >= 3) {
+    size_t expected_len = 3 + this->rx_buffer_[2] + 2;
+
+    // Sanity check: payload_len shouldn't be absurd
+    if (this->rx_buffer_[2] > 50) {
+      ESP_LOGD(TAG, "Suspicious payload length %u for 0x%02X, discarding",
+               this->rx_buffer_[2], static_cast<uint8_t>(this->query_list_[this->query_index_]));
+      this->consecutive_errors_++;
+      this->update_connection_status_();
+      this->advance_to_next_query_();
+      return;
+    }
 
     if (this->rx_len_ >= expected_len) {
-      // Complete response received
       this->log_hex_("RX", this->rx_buffer_, this->rx_len_);
       this->process_received_data_();
       this->update_connection_status_();
@@ -417,20 +478,25 @@ void DiehlPlatinumComponent::handle_wait_response_() {
 
   // Timeout
   if (elapsed > RESPONSE_TIMEOUT_MS) {
-    if (this->rx_len_ > 0) {
-      this->log_hex_("RX (timeout)", this->rx_buffer_, this->rx_len_);
+    if (this->rx_synced_ && this->rx_len_ > 0) {
+      this->log_hex_("RX (timeout, incomplete)", this->rx_buffer_, this->rx_len_);
 
       if (this->rx_len_ >= MIN_RESPONSE_LEN) {
         this->process_received_data_();
       } else {
-        ESP_LOGD(TAG, "Response too short (%zu bytes) for 0x%02X after timeout",
+        ESP_LOGD(TAG, "Response too short (%zu bytes) for 0x%02X",
                  this->rx_len_, static_cast<uint8_t>(this->query_list_[this->query_index_]));
         this->consecutive_errors_++;
       }
     } else {
-      ESP_LOGD(TAG, "Response timeout, no data for 0x%02X (loopback skipped: %zu/%zu)",
-               static_cast<uint8_t>(this->query_list_[this->query_index_]),
-               this->loopback_skipped_, this->tx_frame_len_);
+      if (this->noise_zeros_discarded_ > 0) {
+        ESP_LOGD(TAG, "Response timeout for 0x%02X (only %u zero-bytes received = line noise)",
+                 static_cast<uint8_t>(this->query_list_[this->query_index_]),
+                 (unsigned) this->noise_zeros_discarded_);
+      } else {
+        ESP_LOGD(TAG, "Response timeout for 0x%02X (no data at all)",
+                 static_cast<uint8_t>(this->query_list_[this->query_index_]));
+      }
       this->consecutive_errors_++;
     }
 
@@ -440,7 +506,7 @@ void DiehlPlatinumComponent::handle_wait_response_() {
 }
 
 // ============================================================================
-// Advance to the next query in the cycle
+// Advance to next query
 // ============================================================================
 
 void DiehlPlatinumComponent::advance_to_next_query_() {
@@ -449,7 +515,7 @@ void DiehlPlatinumComponent::advance_to_next_query_() {
 }
 
 // ============================================================================
-// Process the actual data response
+// Process received data
 // ============================================================================
 
 void DiehlPlatinumComponent::process_received_data_() {
@@ -457,7 +523,6 @@ void DiehlPlatinumComponent::process_received_data_() {
 
   if (this->rx_len_ >= 1 && this->rx_buffer_[0] == RESPONSE_END_OF_LIST) {
     ESP_LOGD(TAG, "Error response for value type 0x%02X", static_cast<uint8_t>(vtype));
-    this->consecutive_errors_++;
     return;
   }
 
@@ -468,10 +533,9 @@ void DiehlPlatinumComponent::process_received_data_() {
     return;
   }
 
-  // Successful response — reset error counter
+  // Success — reset error counter
   this->consecutive_errors_ = 0;
 
-  // Parse and publish based on type
   switch (vtype) {
     case VALUE_STATE:
       if (this->operating_state_text_sensor_ != nullptr && this->rx_len_ >= 6) {
@@ -740,7 +804,6 @@ void DiehlPlatinumComponent::update_connection_status_() {
   } else if (this->consecutive_errors_ == 0) {
     this->connected_ = true;
   }
-  // For values between 0 and MAX, keep previous state (hysteresis)
 
   if (this->connection_status_binary_sensor_ != nullptr && was_connected != this->connected_) {
     this->connection_status_binary_sensor_->publish_state(this->connected_);
@@ -753,7 +816,7 @@ void DiehlPlatinumComponent::update_connection_status_() {
 }
 
 // ============================================================================
-// Protocol: Validate response checksum
+// Validate CRC
 // ============================================================================
 
 bool DiehlPlatinumComponent::validate_checksum_(const uint8_t *buffer, size_t length) {
@@ -772,7 +835,7 @@ bool DiehlPlatinumComponent::validate_checksum_(const uint8_t *buffer, size_t le
 }
 
 // ============================================================================
-// Protocol: Parse numeric value from response
+// Parse numeric value from response
 // ============================================================================
 
 float DiehlPlatinumComponent::parse_value_response_(const uint8_t *buffer, size_t length, DiehlValueType type) {
@@ -783,219 +846,6 @@ float DiehlPlatinumComponent::parse_value_response_(const uint8_t *buffer, size_
 
   uint8_t payload_len = buffer[2];
   const uint8_t *payload = &buffer[3];
-  size_t data_bytes = length - 3 - 2;  // actual payload bytes available
-
-  ESP_LOGD(TAG, "Parsing 0x%02X: payload_len=%u, data_bytes=%zu",
-           static_cast<uint8_t>(type), payload_len, data_bytes);
-
-  switch (type) {
-    // ---- Power / frequency: big-endian ÷ 10 ----
-    case VALUE_P_AC:
-    case VALUE_P_DC:
-    case VALUE_F_AC:
-    case VALUE_RED_RELATIV:
-      if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw) / 10.0f;
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]) / 10.0f;
-      }
-      break;
-
-    // ---- Voltage: big-endian integer ----
-    case VALUE_U_AC_1:
-    case VALUE_U_AC_2:
-    case VALUE_U_AC_3:
-    case VALUE_U_DC:
-    case VALUE_RED_ABSOLUT:
-      if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw);
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]);
-      }
-      break;
-
-    // ---- Current: ÷ 10 ----
-    case VALUE_I_AC_1:
-    case VALUE_I_AC_2:
-    case VALUE_I_AC_3:
-    case VALUE_I_DC:
-      if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw) / 10.0f;
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]) / 10.0f;
-      }
-      break;
-
-    // ---- Energy today: integer Wh ----
-    case VALUE_E_DAY:
-      if (data_bytes >= 4) {
-        uint32_t raw = (static_cast<uint32_t>(payload[0]) << 24) |
-                       (static_cast<uint32_t>(payload[1]) << 16) |
-                       (static_cast<uint32_t>(payload[2]) << 8) |
-                       payload[3];
-        return static_cast<float>(raw);
-      } else if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw);
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]);
-      }
-      break;
-
-    // ---- Energy total: Wh → kWh ----
-    case VALUE_E_TOTAL:
-      if (data_bytes >= 4) {
-        uint32_t raw = (static_cast<uint32_t>(payload[0]) << 24) |
-                       (static_cast<uint32_t>(payload[1]) << 16) |
-                       (static_cast<uint32_t>(payload[2]) << 8) |
-                       payload[3];
-        return static_cast<float>(raw) / 1000.0f;
-      } else if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw) / 1000.0f;
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]) / 1000.0f;
-      }
-      break;
-
-    // ---- Hours total ----
-    case VALUE_H_TOTAL:
-      if (data_bytes >= 4) {
-        uint32_t raw = (static_cast<uint32_t>(payload[0]) << 24) |
-                       (static_cast<uint32_t>(payload[1]) << 16) |
-                       (static_cast<uint32_t>(payload[2]) << 8) |
-                       payload[3];
-        return static_cast<float>(raw);
-      } else if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw);
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]);
-      }
-      break;
-
-    // ---- Hours today / reduction duration: ÷ 10 ----
-    case VALUE_H_ON:
-    case VALUE_RED_ACTIV:
-      if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw) / 10.0f;
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]) / 10.0f;
-      }
-      break;
-
-    // ---- Temperature: integer °C ----
-    case VALUE_T_WR_1:
-    case VALUE_T_WR_2:
-    case VALUE_T_WR_3:
-    case VALUE_T_WR_4:
-    case VALUE_T_WR_5:
-    case VALUE_T_WR_6:
-      if (data_bytes >= 1) {
-        return static_cast<float>(payload[0]);
-      }
-      break;
-
-    // ---- Insulation resistance ----
-    case VALUE_R_ISO:
-      if (data_bytes >= 2) {
-        uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-        return static_cast<float>(raw);
-      } else if (data_bytes == 1) {
-        return static_cast<float>(payload[0]);
-      }
-      break;
-
-    // ---- State: 1-byte ----
-    case VALUE_STATE:
-      if (data_bytes >= 1) {
-        return static_cast<float>(payload[0]);
-      }
-      break;
-
-    default:
-      break;
-  }
-
-  ESP_LOGD(TAG, "Could not parse value for type 0x%02X (data_bytes=%zu)", static_cast<uint8_t>(type), data_bytes);
-  return NAN;
-}
-
-// ============================================================================
-// Protocol: Parse string value from response
-// ============================================================================
-
-std::string DiehlPlatinumComponent::parse_string_response_(const uint8_t *buffer, size_t length) {
-  if (length < MIN_RESPONSE_LEN) return "";
-
   size_t data_bytes = length - 3 - 2;
-  const uint8_t *payload = &buffer[3];
 
-  if (data_bytes == 0) return "";
-
-  if (data_bytes == 1) {
-    return str_snprintf("%u", 4, payload[0]);
-  } else if (data_bytes == 2) {
-    uint16_t raw = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
-    return str_snprintf("%u", 6, raw);
-  } else {
-    // Try ASCII
-    bool is_ascii = true;
-    for (size_t i = 0; i < data_bytes; i++) {
-      if (payload[i] < 0x20 || payload[i] > 0x7E) {
-        is_ascii = false;
-        break;
-      }
-    }
-    if (is_ascii) {
-      return std::string(reinterpret_cast<const char *>(payload), data_bytes);
-    }
-    // Hex fallback
-    std::string result;
-    for (size_t i = 0; i < data_bytes; i++) {
-      if (i > 0) result += ":";
-      char buf[4];
-      sprintf(buf, "%02X", payload[i]);
-      result += buf;
-    }
-    return result;
-  }
-}
-
-// ============================================================================
-// Operating State to String
-// ============================================================================
-
-const char *DiehlPlatinumComponent::operating_state_to_string(uint8_t state) {
-  switch (state) {
-    case STATE_INIT:      return "Initializing";
-    case STATE_WAIT:      return "Waiting";
-    case STATE_CHK_DC:    return "Checking DC";
-    case STATE_CHK_AC:    return "Checking AC";
-    case STATE_FEED_IN:   return "Feeding In";
-    case STATE_REDUCE:    return "Reduced Power";
-    case STATE_COOL_DOWN: return "Cooling Down";
-    case STATE_NIGHT:     return "Night Mode";
-    case STATE_ERROR:     return "Error";
-    case STATE_DERATING:  return "Derating";
-    default:              return "Unknown";
-  }
-}
-
-// ============================================================================
-// UART Helpers
-// ============================================================================
-
-void DiehlPlatinumComponent::clear_rx_buffer_() {
-  uint8_t tmp;
-  while (this->available()) {
-    this->read_byte(&tmp);
-  }
-}
-
-}  // namespace diehl
-}  // namespace esphome
+  ESP_LOGD(TAG, "Parsing 0
